@@ -12,6 +12,86 @@ document.addEventListener('DOMContentLoaded', async () => {
   const status = document.getElementById('adminStatus');
   const chartCanvas = document.getElementById('monthlyBookingsChart');
   let chartInstance = null;
+  let chartLoaderPromise = null;
+  let lastReportData = [];
+  let usingCanvasFallback = false;
+
+  const loadScript = (src) => new Promise((resolve, reject) => {
+    const script = document.createElement('script');
+    script.src = src;
+    script.async = true;
+    script.onload = resolve;
+    script.onerror = () => reject(new Error(`Failed to load ${src}`));
+    document.head.appendChild(script);
+  });
+
+  const ensureChartLibrary = async () => {
+    if (window.Chart) {
+      return true;
+    }
+
+    if (!chartLoaderPromise) {
+      chartLoaderPromise = (async () => {
+        const fallbackSources = [
+          'https://unpkg.com/chart.js@4.4.7/dist/chart.umd.min.js',
+          'https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.7/chart.umd.min.js'
+        ];
+
+        for (const source of fallbackSources) {
+          try {
+            await loadScript(source);
+            if (window.Chart) {
+              return true;
+            }
+          } catch (error) {
+            // Try next fallback CDN.
+          }
+        }
+
+        return false;
+      })();
+    }
+
+    return chartLoaderPromise;
+  };
+
+  const getOrCreateChartFallback = () => {
+    if (!chartCanvas || !chartCanvas.parentElement) {
+      return null;
+    }
+
+    let fallback = document.getElementById('monthlyBookingsFallback');
+    if (!fallback) {
+      fallback = document.createElement('div');
+      fallback.id = 'monthlyBookingsFallback';
+      fallback.className = 'summary-pill mt-3';
+      fallback.style.display = 'none';
+      chartCanvas.parentElement.appendChild(fallback);
+    }
+
+    return fallback;
+  };
+
+  const showChartFallback = (message) => {
+    const fallback = getOrCreateChartFallback();
+    if (!fallback || !chartCanvas) {
+      return;
+    }
+
+    chartCanvas.style.display = 'none';
+    fallback.textContent = message;
+    fallback.style.display = 'inline-flex';
+  };
+
+  const hideChartFallback = () => {
+    const fallback = getOrCreateChartFallback();
+    if (chartCanvas) {
+      chartCanvas.style.display = 'block';
+    }
+    if (fallback) {
+      fallback.style.display = 'none';
+    }
+  };
 
   const renderEventStatus = (event) => {
     if (event.availableSeats <= 0) {
@@ -25,10 +105,166 @@ document.addEventListener('DOMContentLoaded', async () => {
     return '<span class="badge badge-soft">Open</span>';
   };
 
-  const renderMonthlyChart = (report) => {
-    if (!window.Chart || !chartCanvas) {
+  const renderCanvasFallbackChart = (report) => {
+    if (!chartCanvas) {
+      return false;
+    }
+
+    const context = chartCanvas.getContext('2d');
+    if (!context) {
+      return false;
+    }
+
+    const labels = report.map((row) => row.label);
+    const bookingValues = report.map((row) => row.bookingsCount);
+    const seatValues = report.map((row) => row.seatsBooked);
+    const maxValue = Math.max(...bookingValues, ...seatValues, 1);
+
+    const cssWidth = chartCanvas.clientWidth || chartCanvas.parentElement?.clientWidth || 760;
+    const cssHeight = Math.max(chartCanvas.clientHeight || 220, 220);
+    const pixelRatio = window.devicePixelRatio || 1;
+
+    chartCanvas.width = Math.floor(cssWidth * pixelRatio);
+    chartCanvas.height = Math.floor(cssHeight * pixelRatio);
+    context.setTransform(pixelRatio, 0, 0, pixelRatio, 0, 0);
+    context.clearRect(0, 0, cssWidth, cssHeight);
+
+    const plot = {
+      left: 50,
+      top: 24,
+      right: cssWidth - 18,
+      bottom: cssHeight - 40
+    };
+    plot.width = Math.max(plot.right - plot.left, 10);
+    plot.height = Math.max(plot.bottom - plot.top, 10);
+
+    context.fillStyle = '#4d3f31';
+    context.font = '600 12px "Plus Jakarta Sans", sans-serif';
+    context.fillText('Bookings', plot.left, 14);
+    context.fillStyle = 'rgba(24, 176, 138, 0.8)';
+    context.fillRect(plot.left + 58, 5, 12, 9);
+    context.fillStyle = '#4d3f31';
+    context.fillText('Seats Booked', plot.left + 82, 14);
+    context.strokeStyle = 'rgba(213, 171, 87, 0.95)';
+    context.lineWidth = 2;
+    context.beginPath();
+    context.moveTo(plot.left + 173, 10);
+    context.lineTo(plot.left + 191, 10);
+    context.stroke();
+
+    for (let step = 0; step <= 4; step += 1) {
+      const y = plot.top + (plot.height / 4) * step;
+      const value = Math.round(maxValue * (1 - step / 4));
+      context.strokeStyle = 'rgba(112, 84, 50, 0.12)';
+      context.lineWidth = 1;
+      context.beginPath();
+      context.moveTo(plot.left, y);
+      context.lineTo(plot.right, y);
+      context.stroke();
+
+      context.fillStyle = '#6a5a48';
+      context.font = '11px "Plus Jakarta Sans", sans-serif';
+      context.fillText(String(value), 10, y + 4);
+    }
+
+    context.strokeStyle = 'rgba(112, 84, 50, 0.2)';
+    context.lineWidth = 1.25;
+    context.beginPath();
+    context.moveTo(plot.left, plot.bottom);
+    context.lineTo(plot.right, plot.bottom);
+    context.stroke();
+
+    const count = labels.length;
+    const slotWidth = plot.width / Math.max(count, 1);
+    const barWidth = Math.max(Math.min(slotWidth * 0.5, 28), 8);
+    const points = [];
+    const showEveryLabel = slotWidth >= 42;
+
+    labels.forEach((label, index) => {
+      const centerX = plot.left + slotWidth * index + slotWidth / 2;
+      const bookingHeight = (bookingValues[index] / maxValue) * plot.height;
+      const barY = plot.bottom - bookingHeight;
+
+      context.fillStyle = 'rgba(24, 176, 138, 0.7)';
+      context.fillRect(centerX - barWidth / 2, barY, barWidth, bookingHeight);
+
+      const seatY = plot.bottom - (seatValues[index] / maxValue) * plot.height;
+      points.push({ x: centerX, y: seatY });
+
+      if (showEveryLabel || index % 2 === 0 || index === count - 1 || index === 0) {
+        context.fillStyle = '#6a5a48';
+        context.font = '10.5px "Plus Jakarta Sans", sans-serif';
+        context.textAlign = 'center';
+        context.fillText(label, centerX, cssHeight - 10);
+      }
+    });
+
+    context.textAlign = 'start';
+    context.strokeStyle = 'rgba(213, 171, 87, 0.95)';
+    context.lineWidth = 2;
+    context.beginPath();
+    points.forEach((point, index) => {
+      if (index === 0) {
+        context.moveTo(point.x, point.y);
+      } else {
+        context.lineTo(point.x, point.y);
+      }
+    });
+    context.stroke();
+
+    context.fillStyle = 'rgba(213, 171, 87, 0.95)';
+    points.forEach((point) => {
+      context.beginPath();
+      context.arc(point.x, point.y, 2.8, 0, Math.PI * 2);
+      context.fill();
+    });
+
+    return true;
+  };
+
+  const renderMonthlyChart = async (report) => {
+    if (!chartCanvas) {
       return;
     }
+
+    const hasData = report.some((row) => row.bookingsCount > 0 || row.seatsBooked > 0);
+
+    lastReportData = report;
+
+    if (!hasData) {
+      usingCanvasFallback = false;
+      if (chartInstance) {
+        chartInstance.destroy();
+        chartInstance = null;
+      }
+      showChartFallback('No booking trend yet. Create more bookings to populate this chart.');
+      return;
+    }
+
+    if (!window.Chart) {
+      showChartFallback('Loading chart library from backup source...');
+      const loaded = await ensureChartLibrary();
+      if (!loaded || !window.Chart) {
+        const rendered = renderCanvasFallbackChart(report);
+        if (rendered) {
+          usingCanvasFallback = true;
+          hideChartFallback();
+        } else {
+          usingCanvasFallback = false;
+          showChartFallback('Unable to render chart in this browser.');
+        }
+        return;
+      }
+      usingCanvasFallback = false;
+      hideChartFallback();
+    }
+
+    if (!window.Chart) {
+      showChartFallback('Chart library failed to load from all CDNs. Please check internet/firewall settings.');
+      return;
+    }
+
+    hideChartFallback();
 
     const labels = report.map((row) => row.label);
     const bookingValues = report.map((row) => row.bookingsCount);
@@ -67,18 +303,18 @@ document.addEventListener('DOMContentLoaded', async () => {
         plugins: {
           legend: {
             labels: {
-              color: '#dbe7f4'
+              color: '#4d3f31'
             }
           }
         },
         scales: {
           x: {
-            ticks: { color: '#9eafc4' },
-            grid: { color: 'rgba(255,255,255,0.06)' }
+            ticks: { color: '#6a5a48' },
+            grid: { color: 'rgba(112, 84, 50, 0.12)' }
           },
           y: {
-            ticks: { color: '#9eafc4' },
-            grid: { color: 'rgba(255,255,255,0.06)' },
+            ticks: { color: '#6a5a48' },
+            grid: { color: 'rgba(112, 84, 50, 0.12)' },
             beginAtZero: true
           }
         }
@@ -151,7 +387,7 @@ document.addEventListener('DOMContentLoaded', async () => {
       </div>
     `;
 
-    reportTableBody.innerHTML = report.slice().reverse().map((row) => `
+    reportTableBody.innerHTML = report.map((row) => `
       <tr>
         <td>${row.label}</td>
         <td>${row.bookingsCount}</td>
@@ -159,7 +395,7 @@ document.addEventListener('DOMContentLoaded', async () => {
       </tr>
     `).join('') || '<tr><td colspan="3" class="text-center text-muted py-4">No report data</td></tr>';
 
-    renderMonthlyChart(report);
+    await renderMonthlyChart(report);
 
     eventsContainer.innerHTML = events.map((event) => `
       <tr>
@@ -233,6 +469,12 @@ document.addEventListener('DOMContentLoaded', async () => {
       } catch (error) {
         App.showMessage(status, error.message);
       }
+    }
+  });
+
+  window.addEventListener('resize', () => {
+    if (usingCanvasFallback && lastReportData.length) {
+      renderCanvasFallbackChart(lastReportData);
     }
   });
 
